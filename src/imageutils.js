@@ -36,7 +36,7 @@ export default class ImageUtils extends Plugin {
      * Also, see {@link module:image/imageutils~ImageUtils#isImageWidget}.
      */
     isInlineImageView(element) {
-        return !!element && element.is('element', 'img');
+        return element?.is('element', 'img') || false;
     }
     /**
      * Checks if the provided view element represents a block image.
@@ -44,7 +44,7 @@ export default class ImageUtils extends Plugin {
      * Also, see {@link module:image/imageutils~ImageUtils#isImageWidget}.
      */
     isBlockImageView(element) {
-        return !!element && element.is('element', 'figure') && element.hasClass('image');
+        return element?.is('element', 'figure') && element.hasClass('image');
     }
     /**
      * Handles inserting single file. This method unifies image insertion using {@link module:widget/utils~findOptimalInsertionRange}
@@ -76,27 +76,21 @@ export default class ImageUtils extends Plugin {
         const model = editor.model;
         const selection = model.document.selection;
         const determinedImageType = determineImageTypeForInsertion(editor, selectable || selection, imageType);
-        // Mix declarative attributes with selection attributes because the new image should "inherit"
-        // the latter for best UX. For instance, inline images inserted into existing links
-        // should not split them. To do that, they need to have "linkHref" inherited from the selection.
-        attributes = {
-            ...Object.fromEntries(selection.getAttributes()),
-            ...attributes
-        };
-        for (const attributeName in attributes) {
-            if (!model.schema.checkAttribute(determinedImageType, attributeName)) {
-                delete attributes[attributeName];
-            }
-        }
+        
+        // Prepare attributes efficiently
+        const finalAttributes = this._prepareImageAttributes(attributes, selection, determinedImageType);
+        
         return model.change(writer => {
             const { setImageSizes = true } = options;
-            const imageElement = writer.createElement(determinedImageType, attributes);
+            const imageElement = writer.createElement(determinedImageType, finalAttributes);
+            
             model.insertObject(imageElement, selectable, null, {
                 setSelection: 'on',
                 // If we want to insert a block image (for whatever reason) then we don't want to split text blocks.
                 // This applies only when we don't have the selectable specified (i.e., we insert multiple block images at once).
-                findOptimalPosition: !selectable && determinedImageType != 'imageInline' ? 'auto' : undefined
+                findOptimalPosition: !selectable && determinedImageType !== 'imageInline' ? 'auto' : undefined
             });
+            
             // Inserting an image might've failed due to schema regulations.
             if (imageElement.parent) {
                 if (setImageSizes) {
@@ -106,6 +100,37 @@ export default class ImageUtils extends Plugin {
             }
             return null;
         });
+    }
+    
+    /**
+     * Prepares and filters image attributes for insertion.
+     * 
+     * @private
+     * @param attributes User provided attributes
+     * @param selection Current selection
+     * @param imageType Determined image type
+     * @return Filtered attributes object
+     */
+    _prepareImageAttributes(attributes, selection, imageType) {
+        const model = this.editor.model;
+        
+        // Mix declarative attributes with selection attributes because the new image should "inherit"
+        // the latter for best UX. For instance, inline images inserted into existing links
+        // should not split them. To do that, they need to have "linkHref" inherited from the selection.
+        const combinedAttributes = {
+            ...Object.fromEntries(selection.getAttributes()),
+            ...attributes
+        };
+        
+        // Filter out attributes that are not allowed by the schema
+        const filteredAttributes = {};
+        for (const attributeName in combinedAttributes) {
+            if (model.schema.checkAttribute(imageType, attributeName)) {
+                filteredAttributes[attributeName] = combinedAttributes[attributeName];
+            }
+        }
+        
+        return filteredAttributes;
     }
     /**
      * Reads original image sizes and sets them as `width` and `height`.
@@ -121,10 +146,26 @@ export default class ImageUtils extends Plugin {
         if (imageElement.getAttribute('width') || imageElement.getAttribute('height')) {
             return;
         }
+        
         this.editor.model.change(writer => {
             const img = new global.window.Image();
+            let timeoutId;
+            
+            const cleanup = () => {
+                this._domEmitter.stopListening(img, 'load');
+                this._domEmitter.stopListening(img, 'error');
+                if (timeoutId) {
+                    global.window.clearTimeout(timeoutId);
+                }
+            };
+            
             this._domEmitter.listenTo(img, 'load', () => {
-                if (!imageElement.getAttribute('width') && !imageElement.getAttribute('height')) {
+                // Double-check that the element still exists and doesn't have dimensions set
+                if (imageElement.root && 
+                    !imageElement.getAttribute('width') && 
+                    !imageElement.getAttribute('height') &&
+                    img.naturalWidth > 0 && img.naturalHeight > 0) {
+                    
                     // We use writer.batch to be able to undo (in a single step) width and height setting
                     // along with any change that triggered this action (e.g. image resize or image style change).
                     this.editor.model.enqueueChange(writer.batch, writer => {
@@ -132,8 +173,18 @@ export default class ImageUtils extends Plugin {
                         writer.setAttribute('height', img.naturalHeight, imageElement);
                     });
                 }
-                this._domEmitter.stopListening(img, 'load');
+                cleanup();
             });
+            
+            this._domEmitter.listenTo(img, 'error', () => {
+                cleanup();
+            });
+            
+            // Add timeout to prevent memory leaks from images that never load
+            timeoutId = global.window.setTimeout(() => {
+                cleanup();
+            }, 10000); // 10 second timeout
+            
             img.src = src;
         });
     }
@@ -141,29 +192,49 @@ export default class ImageUtils extends Plugin {
      * Returns an image widget editing view element if one is selected or is among the selection's ancestors.
      */
     getClosestSelectedImageWidget(selection) {
-        const selectionPosition = selection.getFirstPosition();
-        if (!selectionPosition) {
+        if (!selection) {
             return null;
         }
+        
+        // First check if we have a directly selected image widget
         const viewElement = selection.getSelectedElement();
         if (viewElement && this.isImageWidget(viewElement)) {
             return viewElement;
         }
-        let parent = selectionPosition.parent;
-        while (parent) {
-            if (parent.is('element') && this.isImageWidget(parent)) {
-                return parent;
-            }
-            parent = parent.parent;
+        
+        // Then check ancestors
+        const selectionPosition = selection.getFirstPosition();
+        if (!selectionPosition) {
+            return null;
         }
-        return null;
+        
+        // Optimize ancestor traversal by using findAncestor with a predicate
+        return selectionPosition.findAncestor(element => 
+            element.is('element') && this.isImageWidget(element)
+        );
     }
     /**
      * Returns a image model element if one is selected or is among the selection's ancestors.
      */
     getClosestSelectedImageElement(selection) {
+        if (!selection) {
+            return null;
+        }
+        
         const selectedElement = selection.getSelectedElement();
-        return this.isImage(selectedElement) ? selectedElement : selection.getFirstPosition().findAncestor('imageBlock');
+        if (this.isImage(selectedElement)) {
+            return selectedElement;
+        }
+        
+        const firstPosition = selection.getFirstPosition();
+        if (!firstPosition) {
+            return null;
+        }
+        
+        // Look for both imageBlock and imageInline ancestors
+        return firstPosition.findAncestor(element => 
+            element && (element.is('element', 'imageBlock') || element.is('element', 'imageInline'))
+        );
     }
     /**
      * Returns an image widget editing view based on the passed image view.
@@ -179,7 +250,55 @@ export default class ImageUtils extends Plugin {
     isImageAllowed() {
         const model = this.editor.model;
         const selection = model.document.selection;
-        return isImageAllowedInParent(this.editor, selection) && isNotInsideImage(selection);
+        return this._isImageAllowedInParent(selection) && this._isNotInsideImage(selection);
+    }
+    
+    /**
+     * Checks if image is allowed by schema in optimal insertion parent.
+     * 
+     * @private
+     * @param selection Current selection
+     * @return True if image can be inserted
+     */
+    _isImageAllowedInParent(selection) {
+        const imageType = determineImageTypeForInsertion(this.editor, selection, null);
+        
+        if (imageType === 'imageBlock') {
+            const parent = this._getInsertImageParent(selection);
+            return this.editor.model.schema.checkChild(parent, 'imageBlock');
+        }
+        
+        return this.editor.model.schema.checkChild(selection.focus, 'imageInline');
+    }
+    
+    /**
+     * Checks if selection is not placed inside an image (e.g. its caption).
+     * 
+     * @private
+     * @param selection Current selection
+     * @return True if selection is not inside an image
+     */
+    _isNotInsideImage(selection) {
+        return !selection.focus.findAncestor('imageBlock');
+    }
+    
+    /**
+     * Returns a node that will be used to insert image with `model.insertContent`.
+     * 
+     * @private
+     * @param selection Current selection
+     * @return Parent element for image insertion
+     */
+    _getInsertImageParent(selection) {
+        const model = this.editor.model;
+        const insertionRange = findOptimalInsertionRange(selection, model);
+        const parent = insertionRange.start.parent;
+        
+        if (parent.isEmpty && !parent.is('element', '$root')) {
+            return parent.parent;
+        }
+        
+        return parent;
     }
     /**
      * Converts a given {@link module:engine/view/element~Element} to an image widget:
@@ -203,19 +322,19 @@ export default class ImageUtils extends Plugin {
      * Checks if a given view element is an image widget.
      */
     isImageWidget(viewElement) {
-        return !!viewElement.getCustomProperty('image') && isWidget(viewElement);
+        return viewElement?.getCustomProperty('image') && isWidget(viewElement);
     }
     /**
      * Checks if the provided model element is an `image`.
      */
     isBlockImage(modelElement) {
-        return !!modelElement && modelElement.is('element', 'imageBlock');
+        return modelElement?.is('element', 'imageBlock') || false;
     }
     /**
      * Checks if the provided model element is an `imageInline`.
      */
     isInlineImage(modelElement) {
-        return !!modelElement && modelElement.is('element', 'imageInline');
+        return modelElement?.is('element', 'imageInline') || false;
     }
     /**
      * Get the view `<img>` from another view element, e.g. a widget (`<figure class="image">`), a link (`<a>`).
@@ -223,15 +342,48 @@ export default class ImageUtils extends Plugin {
      * The `<img>` can be located deep in other elements, so this helper performs a deep tree search.
      */
     findViewImgElement(figureView) {
+        if (!figureView) {
+            return null;
+        }
+        
         if (this.isInlineImageView(figureView)) {
             return figureView;
         }
-        const editingView = this.editor.editing.view;
-        for (const { item } of editingView.createRangeIn(figureView)) {
-            if (this.isInlineImageView(item)) {
-                return item;
+        
+        // Optimized search - use recursive approach instead of range iteration for better performance
+        return this._findImgElementRecursive(figureView);
+    }
+    
+    /**
+     * Recursively searches for an img element within a view element.
+     * 
+     * @private
+     * @param element The element to search in
+     * @return The found img element or null
+     */
+    _findImgElementRecursive(element) {
+        if (!element || !element.is('element')) {
+            return null;
+        }
+        
+        // Check direct children first for better performance
+        for (const child of element.getChildren()) {
+            if (this.isInlineImageView(child)) {
+                return child;
             }
         }
+        
+        // Then check nested elements
+        for (const child of element.getChildren()) {
+            if (child.is('element')) {
+                const found = this._findImgElementRecursive(child);
+                if (found) {
+                    return found;
+                }
+            }
+        }
+        
+        return null;
     }
     /**
      * @inheritDoc
@@ -241,39 +393,7 @@ export default class ImageUtils extends Plugin {
         return super.destroy();
     }
 }
-/**
- * Checks if image is allowed by schema in optimal insertion parent.
- */
-function isImageAllowedInParent(editor, selection) {
-    const imageType = determineImageTypeForInsertion(editor, selection, null);
-    if (imageType == 'imageBlock') {
-        const parent = getInsertImageParent(selection, editor.model);
-        if (editor.model.schema.checkChild(parent, 'imageBlock')) {
-            return true;
-        }
-    }
-    else if (editor.model.schema.checkChild(selection.focus, 'imageInline')) {
-        return true;
-    }
-    return false;
-}
-/**
- * Checks if selection is not placed inside an image (e.g. its caption).
- */
-function isNotInsideImage(selection) {
-    return [...selection.focus.getAncestors()].every(ancestor => !ancestor.is('element', 'imageBlock'));
-}
-/**
- * Returns a node that will be used to insert image with `model.insertContent`.
- */
-function getInsertImageParent(selection, model) {
-    const insertionRange = findOptimalInsertionRange(selection, model);
-    const parent = insertionRange.start.parent;
-    if (parent.isEmpty && !parent.is('element', '$root')) {
-        return parent.parent;
-    }
-    return parent;
-}
+
 /**
  * Determine image element type name depending on editor config or place of insertion.
  *

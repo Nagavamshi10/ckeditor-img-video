@@ -13,10 +13,7 @@ import { Delete } from 'ckeditor5/src/typing.js';
 import { global } from 'ckeditor5/src/utils.js';
 import ImageUtils from './imageutils.js';
 // Implements the pattern: http(s)://(www.)example.com/path/to/resource.ext?query=params&maybe=too.
-const IMAGE_URL_REGEXP = new RegExp(String(/^(http(s)?:\/\/)?[\w-]+\.[\w.~:/[\]@!$&'()*+,;=%-]+/.source +
-    /\.(jpg|jpeg|png|gif|ico|webp|JPG|JPEG|PNG|GIF|ICO|WEBP)/.source +
-    /(\?[\w.~:/[\]@!$&'()*+,;=%-]*)?/.source +
-    /(#[\w.~:/[\]@!$&'()*+,;=%-]*)?$/.source));
+const IMAGE_URL_REGEXP = /^(https?:\/\/)?[\w-]+\.[\w.~:/[\]@!$&'()*+,;=%-]+\.(jpe?g|png|gif|ico|webp)(\?[\w.~:/[\]@!$&'()*+,;=%-]*)?(?:#[\w.~:/[\]@!$&'()*+,;=%-]*)?$/i;
 /**
  * The auto-image plugin. It recognizes image links in the pasted content and embeds
  * them shortly after they are injected into the document.
@@ -42,6 +39,21 @@ export default class AutoImage extends Plugin {
         this._timeoutId = null;
         this._positionToInsert = null;
     }
+
+    /**
+     * Cleans up pending auto-image operation.
+     * @private
+     */
+    _cleanup() {
+        if (this._timeoutId) {
+            global.window.clearTimeout(this._timeoutId);
+            this._timeoutId = null;
+        }
+        if (this._positionToInsert) {
+            this._positionToInsert.detach();
+            this._positionToInsert = null;
+        }
+    }
     /**
      * @inheritDoc
      */
@@ -65,12 +77,7 @@ export default class AutoImage extends Plugin {
             }, { priority: 'high' });
         });
         editor.commands.get('undo').on('execute', () => {
-            if (this._timeoutId) {
-                global.window.clearTimeout(this._timeoutId);
-                this._positionToInsert.detach();
-                this._timeoutId = null;
-                this._positionToInsert = null;
-            }
+            this._cleanup();
         }, { priority: 'high' });
     }
     /**
@@ -85,17 +92,26 @@ export default class AutoImage extends Plugin {
         // TODO: Use a marker instead of LiveRange & LivePositions.
         const urlRange = new LiveRange(leftPosition, rightPosition);
         const walker = urlRange.getWalker({ ignoreElementEnd: true });
-        const selectionAttributes = Object.fromEntries(editor.model.document.selection.getAttributes());
-        const imageUtils = this.editor.plugins.get('ImageUtils');
-        let src = '';
+        
+        // Collect text content more efficiently
+        const textParts = [];
         for (const node of walker) {
             if (node.item.is('$textProxy')) {
-                src += node.item.data;
+                textParts.push(node.item.data);
             }
         }
-        src = src.trim();
+        const src = textParts.join('').trim();
+        
+        // Early exit if no text content
+        if (!src) {
+            urlRange.detach();
+            return;
+        }
+        
+        const selectionAttributes = Object.fromEntries(editor.model.document.selection.getAttributes());
+        const imageUtils = this.editor.plugins.get('ImageUtils');
         // If the URL does not match the image URL regexp, let's skip that.
-        if (!src.match(IMAGE_URL_REGEXP)) {
+        if (!IMAGE_URL_REGEXP.test(src)) {
             urlRange.detach();
             return;
         }
@@ -107,7 +123,7 @@ export default class AutoImage extends Plugin {
             // See https://github.com/ckeditor/ckeditor5/issues/2763.
             // Condition must be checked after timeout - pasting may take place on an element, replacing it. The final position matters.
             const imageCommand = editor.commands.get('insertImage');
-            if (!imageCommand.isEnabled) {
+            if (!imageCommand || !imageCommand.isEnabled) {
                 urlRange.detach();
                 return;
             }
@@ -118,7 +134,7 @@ export default class AutoImage extends Plugin {
                 let insertionPosition;
                 // Check if the position where the element should be inserted is still valid.
                 // Otherwise leave it as undefined to use the logic of insertImage().
-                if (this._positionToInsert.root.rootName !== '$graveyard') {
+                if (this._positionToInsert && this._positionToInsert.root.rootName !== '$graveyard') {
                     insertionPosition = this._positionToInsert.toPosition();
                 }
                 imageUtils.insertImage({ ...selectionAttributes, src }, insertionPosition);
